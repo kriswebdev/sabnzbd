@@ -53,8 +53,8 @@ from sabnzbd.utils.json import JsonWriter
 from sabnzbd.utils.rsslib import RSS, Item
 from sabnzbd.utils.pathbrowser import folders_at_path
 from sabnzbd.misc import loadavg, to_units, diskfree, disktotal, get_ext, \
-    get_filename, int_conv, globber, globber_full, time_format, remove_all, \
-    starts_with_path, cat_convert, clip_path
+                         get_filename, int_conv, globber, time_format, remove_all, \
+                         starts_with_path, cat_convert, sanitize_filename
 from sabnzbd.encoding import xml_name, unicoder, special_fixer, platform_encode, html_escape
 from sabnzbd.postproc import PostProcessor
 from sabnzbd.articlecache import ArticleCache
@@ -311,7 +311,34 @@ def _api_translate(name, output, kwargs):
     """ API: accepts output, value(=acronym) """
     return report(output, keyword='value', data=Tx(kwargs.get('value', '')))
 
+# Helper function
+# Side effect of cherryfile_size is that attribute .value is created
+# which is needed to make add_nzbfile() work
+def cherryfile_size(cherryfile):
+    if hasattr(cherryfile, 'getvalue'):
+        size = cherryfile.length
+    elif hasattr(cherryfile, 'file') and hasattr(cherryfile, 'filename') and cherryfile.filename:
+        # CherryPy 3.2.2 object
+        if hasattr(cherryfile.file, 'file'):
+            cherryfile.value = cherryfile.file.file.read()
+        else:
+            cherryfile.value = cherryfile.file.read()
+        size = len(cherryfile.value)
+    elif hasattr(cherryfile, 'value'):
+        size = len(cherryfile.value)
+    else:
+        size = 0
+    return size
 
+# Helper function
+# Saves an inline file passed in argument
+def inlinefile_save(file, folder):
+    filesize=cherryfile_size(file)
+    if file is not None and filesize and file.filename:
+        #print "FILE NAME:", file.filename, "FILE VALUE:", file.value
+        sanitized_filename = sanitize_filename(platform_encode(file.filename)) # handle empty
+        sabnzbd.save_data(file.value, sanitized_filename, folder, False)
+    
 def _api_addfile(name, output, kwargs):
     """ API: accepts name, output, pp, script, cat, priority, nzbname """
     # When uploading via flash it will send the nzb in a kw arg called Filedata
@@ -320,30 +347,39 @@ def _api_addfile(name, output, kwargs):
     # Normal upload will send the nzb in a kw arg called nzbfile
     if name is None or isinstance(name, basestring):
         name = kwargs.get('nzbfile')
-    if hasattr(name, 'getvalue'):
-        # Side effect of next line is that attribute .value is created
-        # which is needed to make add_nzbfile() work
-        size = name.length
-    elif hasattr(name, 'file') and hasattr(name, 'filename') and name.filename:
-        # CherryPy 3.2.2 object
-        if hasattr(name.file, 'file'):
-            name.value = name.file.file.read()
-        else:
-            name.value = name.file.read()
-        size = len(name.value)
-    elif hasattr(name, 'value'):
-        size = len(name.value)
-    else:
-        size = 0
+    size = cherryfile_size(name)
     if name is not None and size and name.filename:
         cat = kwargs.get('cat')
         xcat = kwargs.get('xcat')
+        inlinefile = kwargs.get('inlinefile') # Inline files
+        
+        # Inline files
+        # Should set priority to PAUSED_PRIORITY while saving the Blob files to avoid inconsistencies
+        target_priority = DEFAULT_PRIORITY if kwargs.get('priority') is None else kwargs.get('priority')
+        priority = PAUSED_PRIORITY if inlinefile is not None else kwargs.get('priority')
+        
         if not cat and xcat:
             # Indexer category, so do mapping
             cat = cat_convert(xcat)
+        
+        #logging.info("kwargs: %s", kwargs)
+        
         res = sabnzbd.add_nzbfile(name, kwargs.get('pp'), kwargs.get('script'), cat,
-                            kwargs.get('priority'), kwargs.get('nzbname'))
-        return report(output, keyword='', data={'status': res[0] == 0, 'nzo_ids': res[1]}, compat=True)
+                            priority, kwargs.get('nzbname'))
+
+        # Inline files
+        if res[0] == 0:        
+            if inlinefile:
+                nzo_id = res[1][0]
+                downpath = NzbQueue.do.get_nzo_downpath(nzo_id)
+                if isinstance(inlinefile, list):
+                    for fileelement in inlinefile:
+                        inlinefile_save(fileelement, downpath)
+                else:
+                    inlinefile_save(inlinefile, downpath)
+                sabnzbd.nzbqueue.set_priority(nzo_id, target_priority) # Resume
+            
+        return report(output, keyword='', data={'status':res[0]==0, 'nzo_ids' : res[1]}, compat=True)
     else:
         return report(output, _MSG_NO_VALUE)
 
@@ -497,7 +533,7 @@ def _api_history(name, output, kwargs):
             return report(output)
         else:
             return report(output, _MSG_NO_VALUE)
-    elif not name:
+    elif not name and not value:
         history, pnfo_list, bytespersec = build_header(True)
         if 'noofslots_total' in history:
             del history['noofslots_total']
@@ -510,6 +546,12 @@ def _api_history(name, output, kwargs):
                                                                               categories=categories,
                                                                               output=output)
         return report(output, keyword='history', data=remove_callable(history))
+    # Single item return
+    elif not name and value:
+        history_db = cherrypy.thread_data.history_db
+        history_list, fetched_items, total_items = history_db.fetch_history()
+        item = [nzo for nzo in history_list if nzo['nzo_id'] == value]
+        return report(output, keyword='history', data=item)
     else:
         return report(output, _MSG_NOT_IMPLEMENTED)
 
@@ -522,6 +564,33 @@ def _api_get_files(name, output, kwargs):
     else:
         return report(output, _MSG_NO_VALUE)
 
+# Adds support for downloaded file reading (support limited to single file NZB of image/jpeg type)
+def _api_read_file(name, output, kwargs):
+    """ API: accepts output, value(=nzo_id) """
+    value = kwargs.get('value')
+    history_db = cherrypy.thread_data.history_db
+    history_list, fetched_items, total_items = history_db.fetch_history()
+    [item] = [nzo for nzo in history_list if nzo['nzo_id'] == value]
+    if item and item['storage']:
+        path = item['storage']
+        if not os.path.exists(path):
+            return report(output, _MSG_NO_PATH)
+        try:
+            _f = open(path, 'rb')
+            data = _f.read()
+            _f.close()
+        except:
+            return report(output, _MSG_NO_PATH)
+        #PostProcessor.do.delete(value)
+        history_db.remove_history(value)
+        os.remove(item['storage'])
+        os.rmdir(os.path.dirname(item['storage']))
+    else:
+        return report(output, _MSG_NO_ITEM)
+    if data:
+        return report(output, data=data, contenttype="image/jpeg") #image/jpeg
+    else:
+        return report(output, _MSG_NO_PATH)
 
 def _api_addurl(names, output, kwargs):
     """ API: accepts name, output, pp, script, cat, priority, nzbname """
@@ -890,6 +959,7 @@ _api_table = {
     'fullstatus': (_api_fullstatus, 2),
     'history': (_api_history, 2),
     'get_files': (_api_get_files, 2),
+    'read_file' : (_api_read_file, 2),
     'addurl': (_api_addurl, 1),
     'addid': (_api_addurl, 1),
     'pause': (_api_pause, 2),
@@ -960,7 +1030,7 @@ def api_level(cmd, name):
     return 4
 
 
-def report(output, error=None, keyword='value', data=None, callback=None, compat=False):
+def report(output, error=None, keyword='value', data=None, callback=None, compat=False, contenttype="text/plain"):
     """ Report message in json, xml or plain text
         If error is set, only an status/error report is made.
         If no error and no data, only a status report is made.
@@ -1007,7 +1077,7 @@ def report(output, error=None, keyword='value', data=None, callback=None, compat
         response = '<?xml version="1.0" encoding="UTF-8" ?>\n%s\n' % status_str
 
     else:
-        content = "text/plain"
+        content = contenttype
         if error:
             response = "error: %s\n" % error
         elif compat or data is None:

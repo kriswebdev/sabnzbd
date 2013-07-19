@@ -39,6 +39,16 @@ except:
     import md5
     new_md5 = md5.new
 
+
+# Inline file support addon
+import base64
+try:
+    import basexml
+    HAVE_BASEXML = True
+except Exception: 
+    HAVE_BASEXML = False
+# /Inline file support
+
 # SABnzbd modules
 import sabnzbd
 from sabnzbd.constants import sample_match, GIGI, ATTRIB_FILE, JOB_ADMIN, \
@@ -182,6 +192,28 @@ class Article(TryList):
     def __repr__(self):
         return "<Article: article=%s, bytes=%s, partnum=%s, art_id=%s>" % \
                (self.article, self.bytes, self.partnum, self.art_id)
+
+################################################################################
+# NzbBlob (Inline File)                                                        #
+################################################################################
+class NzbBlob(TryList):
+    """ Representation of a blob (inline file) within the NZB file
+    """
+    def __init__(self, subject, data, enctype, nzo):
+        """ Setup object """
+        TryList.__init__(self)
+        filename = sanitize_filename(platform_encode(subject)) # handle empty
+        if(filename == ""):
+            filename = "noname"
+        if enctype == "base64":
+            data = base64.b64decode(data)
+        elif enctype == "basexml":
+            if HAVE_BASEXML:
+                data = basexml.decode_string(data)
+            else:
+                logging.warning(T('This install of SABnzbd doesn\'t support BaseXML and hence cannot decode inline file %s'), filename)
+                return
+        sabnzbd.save_data(data, filename, nzo.downpath, False)
 
 
 ##############################################################################
@@ -361,6 +393,7 @@ class NzbParser(xml.sax.handler.ContentHandler):
         self.in_segment = False
         self.in_head = False
         self.in_meta = False
+        self.in_blob = False # inline file support
         self.meta_type = ''
         self.meta_types = {}
         self.meta_content = []
@@ -424,6 +457,18 @@ class NzbParser(xml.sax.handler.ContentHandler):
             if meta_type:
                 self.meta_type = meta_type.lower()
             self.meta_content = []
+            
+        # Inline file support
+        elif name == 'blob' and self.in_nzb:
+            self.in_blob = True
+            self.blob_subject = attrs.get('subject')
+            if self.blob_subject:
+                self.blob_subject = self.blob_subject.lower()
+            self.blob_enctype = attrs.get('enctype')
+            if self.blob_enctype:
+                self.blob_enctype = self.blob_enctype.lower()
+            self.blob_content = StringIO()
+        # /Inline file support
 
         elif name == 'nzb':
             self.in_nzb = True
@@ -435,7 +480,11 @@ class NzbParser(xml.sax.handler.ContentHandler):
             self.article_id.append(content)
         elif self.in_meta:
             self.meta_content.append(content)
-
+        # Inline file support
+        elif self.in_blob:
+            self.blob_content.write(content) # To optimize: not an array
+        # /Inline file support
+        
     def endElement(self, name):
         if name == 'group' and self.in_group:
             group = str(''.join(self.group_name))
@@ -463,6 +512,14 @@ class NzbParser(xml.sax.handler.ContentHandler):
 
         elif name == 'segments' and self.in_segments:
             self.in_segments = False
+
+        # Inline file support within NZB
+        elif name == 'blob' and self.in_blob:
+            self.in_blob = False
+            if self.blob_subject:
+                NzbBlob(self.blob_subject, self.blob_content.getvalue(), self.blob_enctype, self.nzo)
+                self.blob_content.close()
+        # / Inline file support within NZB
 
         elif name == 'file' and self.in_file:
             # Create an NZF
@@ -709,7 +766,9 @@ class NzbObject(TryList):
             parser.setContentHandler(handler)
             parser.setErrorHandler(xml.sax.handler.ErrorHandler())
             inpsrc = xml.sax.xmlreader.InputSource()
+            # inpsrc.setEncoding("ISO-8859-1") # Properly set the NZB XML encoding
             inpsrc.setByteStream(StringIO(nzb))
+            # inpsrc.setEncoding("ISO-8859-1") # Properly set the NZB XML encoding
             try:
                 parser.parse(inpsrc)
             except xml.sax.SAXParseException, err:
@@ -717,7 +776,7 @@ class NzbObject(TryList):
                 if '</nzb>' not in nzb:
                     logging.warning(T('Incomplete NZB file %s'), filename)
                 else:
-                    logging.warning(T('Invalid NZB file %s, skipping (reason=%s, line=%s)'),
+                    logging.warning(T('Invalid NZB file %s, skipping (reason=%s, type=SAXParseException, line=%s)'),
                                     filename, err.getMessage(), err.getLineNumber())
             except Exception, err:
                 self.incomplete = True
@@ -1081,7 +1140,7 @@ class NzbObject(TryList):
         if self.unwanted_ext and self.status == 'Paused':
             prefix += T('UNWANTED') + ' / '  # : Queue indicator for unwanted extensions
         if self.rating_filtered and self.status == 'Paused':
-            prefix += Ta('FILTERED') + ' / '  # : Queue indicator for filtered
+            prefix += T('FILTERED') + ' / '  # : Queue indicator for filtered
         if isinstance(self.wait, float):
             dif = int(self.wait - time.time() + 0.5)
             if dif > 0:
