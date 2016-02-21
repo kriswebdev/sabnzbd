@@ -53,8 +53,8 @@ from sabnzbd.utils.json import JsonWriter
 from sabnzbd.utils.rsslib import RSS, Item
 from sabnzbd.utils.pathbrowser import folders_at_path
 from sabnzbd.misc import loadavg, to_units, diskfree, disktotal, get_ext, \
-                         get_filename, int_conv, globber, time_format, remove_all, \
-                         starts_with_path, cat_convert, sanitize_filename
+                         get_filename, int_conv, globber_full, time_format, remove_all, \
+                         starts_with_path, cat_convert, clip_path, sanitize_filename
 from sabnzbd.encoding import xml_name, unicoder, special_fixer, platform_encode, html_escape
 from sabnzbd.postproc import PostProcessor
 from sabnzbd.articlecache import ArticleCache
